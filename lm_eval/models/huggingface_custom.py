@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+import importlib
 
 import jinja2
 import torch
@@ -44,7 +46,6 @@ from lm_eval.models.utils_hf import (
     stop_sequences_criteria,
 )
 
-import custom_models
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
@@ -55,6 +56,38 @@ if TYPE_CHECKING:
 
 eval_logger = logging.getLogger(__name__)
 TOKENIZER_INFINITY = 1000000000000000019884624838656
+
+
+def load_custom_models(model_path: str) -> None:
+    custom_models_dirname = "custom_models"
+    model_dir = Path(model_path).resolve()
+    package_dir = model_dir / custom_models_dirname
+    package_init = package_dir / "__init__.py"
+    if not package_init.is_file():
+        eval_logger.warning("No custom_models package found at %s", package_init)
+        return
+
+    model_dir_str = str(model_dir)
+    if model_dir_str not in sys.path:
+        sys.path.insert(0, model_dir_str)
+
+    for module_name in list(sys.modules):
+        if module_name == custom_models_dirname or module_name.startswith("custom_models."):
+            del sys.modules[module_name]
+    importlib.invalidate_caches()
+
+    spec = importlib.util.spec_from_file_location(
+        custom_models_dirname,
+        package_init,
+        submodule_search_locations=[str(package_dir)],
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load custom_models from {package_init}")
+
+    custom_models = importlib.util.module_from_spec(spec)
+    sys.modules[custom_models_dirname] = custom_models
+    spec.loader.exec_module(custom_models)
+    print(f"[generate.py] custom_models package: {package_init}", flush=True)
 
 
 @register_model("hf-custom")
@@ -109,9 +142,11 @@ class HFLM(TemplateLM):
         think_end_token: str | int | None = None,
         enable_thinking: bool | None = None,
         chat_template_args: dict[str, Any] | None = None,
+        yarn_max_seq_length: int | None = None,
         **kwargs,
     ) -> None:
         super().__init__()
+        yarn_configured = False
         # optionally: take in an already-initialized transformers.PreTrainedModel
         if not isinstance(pretrained, str):
             eval_logger.warning(
@@ -130,6 +165,8 @@ class HFLM(TemplateLM):
             assert isinstance(pretrained, str)
             assert isinstance(batch_size, (int, str))
 
+            load_custom_models(pretrained)
+            
             accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
             accelerator = Accelerator(kwargs_handlers=[accelerator_kwargs])
             if accelerator.num_processes > 1:
@@ -195,6 +232,7 @@ class HFLM(TemplateLM):
                 gguf_file=gguf_file,
                 subfolder=subfolder,
             )
+            yarn_configured = self._maybe_configure_yarn(yarn_max_seq_length)
 
             # determine which of 'causal' and 'seq2seq' backends to use for HF models
         self._get_backend(
@@ -239,6 +277,7 @@ class HFLM(TemplateLM):
                 gguf_file=gguf_file,
                 quantization_config=quantization_config,
                 subfolder=subfolder,
+                config=self.config if yarn_configured else None,
                 **kwargs,
             )
 
@@ -590,6 +629,42 @@ class HFLM(TemplateLM):
             subfolder=subfolder,
         )
 
+    def _maybe_configure_yarn(self, yarn_max_seq_length: int | None) -> bool:
+        """Enable YaRN when an eval length exceeds the checkpoint context length."""
+        if yarn_max_seq_length is None:
+            return False
+
+        max_position_embeddings = getattr(
+            self._config, "max_position_embeddings", None
+        )
+        if max_position_embeddings is None:
+            eval_logger.warning(
+                "`yarn_max_seq_length` was set, but the model config has no "
+                "`max_position_embeddings`; skipping YaRN auto-configuration."
+            )
+            return False
+
+        yarn_max_seq_length = int(yarn_max_seq_length)
+        max_position_embeddings = int(max_position_embeddings)
+        if yarn_max_seq_length <= max_position_embeddings:
+            return False
+
+        factor = yarn_max_seq_length / max_position_embeddings
+        self._config.rope_scaling = {
+            "rope_type": "yarn",
+            "factor": factor,
+            "original_max_position_embeddings": max_position_embeddings,
+        }
+        self._config.max_position_embeddings = yarn_max_seq_length
+        eval_logger.info(
+            "Enabled YaRN rope scaling for max_seq_length=%s "
+            "(original max_position_embeddings=%s, factor=%.6g).",
+            yarn_max_seq_length,
+            max_position_embeddings,
+            factor,
+        )
+        return True
+
     def _create_model(
         self,
         pretrained: str,
@@ -612,6 +687,7 @@ class HFLM(TemplateLM):
         gguf_file: str | None = None,
         quantization_config: AutoQuantizationConfig | None = None,
         subfolder: str = "",
+        config: transformers.PretrainedConfig | transformers.AutoConfig | None = None,
         **kwargs,
     ) -> None:
         """Initializes an HF or HF-compatible PreTrainedModel from scratch
@@ -646,6 +722,9 @@ class HFLM(TemplateLM):
                 if compute_dtype := model_kwargs.get("bnb_4bit_compute_dtype"):
                     model_kwargs["bnb_4bit_compute_dtype"] = get_dtype(compute_dtype)
 
+            model_load_kwargs = dict(model_kwargs)
+            if config is not None:
+                model_load_kwargs["config"] = config
             self._model = self.AUTO_MODEL_CLASS.from_pretrained(
                 pretrained,
                 revision=revision,
@@ -654,7 +733,7 @@ class HFLM(TemplateLM):
                 gguf_file=gguf_file,
                 quantization_config=quantization_config,
                 subfolder=subfolder,
-                **model_kwargs,
+                **model_load_kwargs,
             )
         else:
             if autogptq and gptqmodel:
@@ -729,12 +808,15 @@ class HFLM(TemplateLM):
                 eval_logger.warning(
                     "Delta weights might trigger unexpected behavior when used with AutoGPTQ."
                 )
+            delta_model_kwargs = dict(model_kwargs)
+            if config is not None:
+                delta_model_kwargs["config"] = config
             _model_delta = self.AUTO_MODEL_CLASS.from_pretrained(
                 delta,
                 revision=revision,
                 dtype=get_dtype(dtype),
                 trust_remote_code=trust_remote_code,
-                **model_kwargs,
+                **delta_model_kwargs,
             )
             for name, param in self._model.state_dict().items():
                 try:
