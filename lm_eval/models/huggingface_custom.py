@@ -143,10 +143,11 @@ class HFLM(TemplateLM):
         enable_thinking: bool | None = None,
         chat_template_args: dict[str, Any] | None = None,
         yarn_max_seq_length: int | None = None,
+        tune_ttt_lr: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
-        yarn_configured = False
+        new_config_configured = False
         # optionally: take in an already-initialized transformers.PreTrainedModel
         if not isinstance(pretrained, str):
             eval_logger.warning(
@@ -232,7 +233,11 @@ class HFLM(TemplateLM):
                 gguf_file=gguf_file,
                 subfolder=subfolder,
             )
-            yarn_configured = self._maybe_configure_yarn(yarn_max_seq_length)
+            factor = self._maybe_configure_yarn(yarn_max_seq_length)
+            if factor:
+                new_config_configured = True
+            if tune_ttt_lr and factor is not False and factor > 1.0:
+                ttt_lr_new = self._maybe_configure_ttt_lr(factor)
 
             # determine which of 'causal' and 'seq2seq' backends to use for HF models
         self._get_backend(
@@ -277,7 +282,7 @@ class HFLM(TemplateLM):
                 gguf_file=gguf_file,
                 quantization_config=quantization_config,
                 subfolder=subfolder,
-                config=self.config if yarn_configured else None,
+                config=self.config if new_config_configured else None,
                 **kwargs,
             )
 
@@ -629,7 +634,7 @@ class HFLM(TemplateLM):
             subfolder=subfolder,
         )
 
-    def _maybe_configure_yarn(self, yarn_max_seq_length: int | None) -> bool:
+    def _maybe_configure_yarn(self, yarn_max_seq_length: int | None) -> float | bool:
         """Enable YaRN when an eval length exceeds the checkpoint context length."""
         if yarn_max_seq_length is None:
             return False
@@ -663,7 +668,25 @@ class HFLM(TemplateLM):
             max_position_embeddings,
             factor,
         )
-        return True
+        return factor
+
+    
+    def _maybe_configure_ttt_lr(self, factor: float | None) -> float | bool:
+        """Enable YaRN when an eval length exceeds the checkpoint context length."""
+        if factor is None:
+            return False
+
+        ttt_lr = getattr(
+            self._config, "ttt_lr", None
+        )
+        self._config.ttt_lr = ttt_lr / factor
+        eval_logger.info(
+            "Tuned ttt_lr based on yarn factor"
+            "(original ttt_lr=%s, new ttt_lr=%s).",
+            ttt_lr,
+            self._config.ttt_lr
+        )
+        return self._config.ttt_lr
 
     def _create_model(
         self,
