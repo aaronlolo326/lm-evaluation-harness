@@ -143,7 +143,7 @@ class HFLM(TemplateLM):
         enable_thinking: bool | None = None,
         chat_template_args: dict[str, Any] | None = None,
         yarn_max_seq_length: int | None = None,
-        tune_ttt_lr: bool = True,
+        tune_tttip_lr: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -236,8 +236,8 @@ class HFLM(TemplateLM):
             factor = self._maybe_configure_yarn(yarn_max_seq_length)
             if factor:
                 new_config_configured = True
-            if tune_ttt_lr and factor is not False and factor > 1.0:
-                ttt_lr_new = self._maybe_configure_ttt_lr(factor)
+            if tune_tttip_lr and factor is not False and factor > 1.0:
+                tttip_lr_new = self._maybe_configure_tttip_lr(factor)
 
             # determine which of 'causal' and 'seq2seq' backends to use for HF models
         self._get_backend(
@@ -671,19 +671,19 @@ class HFLM(TemplateLM):
         return factor
 
     
-    def _maybe_configure_ttt_lr(self, factor: float | None) -> float | bool:
+    def _maybe_configure_tttip_lr(self, factor: float | None) -> float | bool:
         """Enable YaRN when an eval length exceeds the checkpoint context length."""
         if factor is None:
             return False
 
-        ttt_lr = getattr(
+        tttip_lr = getattr(
             self._config, "ttt_lr", None
         )
-        self._config.ttt_lr = ttt_lr / factor
+        self._config.ttt_lr = tttip_lr / factor
         eval_logger.info(
             "Tuned ttt_lr based on yarn factor"
             "(original ttt_lr=%s, new ttt_lr=%s).",
-            ttt_lr,
+            tttip_lr,
             self._config.ttt_lr
         )
         return self._config.ttt_lr
